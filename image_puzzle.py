@@ -507,3 +507,283 @@ class PuzzleGame:
 # ==========================================================================
 # View layer (Tkinter)
 # ==========================================================================
+class BoardCanvas(tk.Canvas):
+    def __init__(self, master: tk.Misc, size: int) -> None:
+        super().__init__(master, width=size, height=size, bg="#2b2b2b",
+                         highlightthickness=1, highlightbackground="#666")
+        self._size = size
+        self._photo: Optional[tk.PhotoImage] = None   
+        self._extent = size                           
+        self._grid = 0
+        self.show_message("Load an image to begin")
+
+    # -- geometry ---------------------------------------------------------
+    @property
+    def cell(self) -> float:
+        return self._extent / self._grid if self._grid else self._extent
+
+    def cell_box(self, position: int) -> Tuple[float, float, float, float]:
+        r, c = divmod(position, self._grid)
+        s = self.cell
+        return c * s, r * s, (c + 1) * s, (r + 1) * s
+
+    def position_at(self, x: int, y: int) -> Optional[int]:
+        if not self._grid or not (0 <= x < self._extent and 0 <= y < self._extent):
+            return None
+        return int(y // self.cell) * self._grid + int(x // self.cell)
+
+    # -- drawing ----------------------------------------------------------
+    def show_message(self, text: str) -> None:
+        self.delete("all")
+        self._grid = 0
+        self.create_text(self._size // 2, self._size // 2, text=text, fill="#bbb",
+                         font=("Helvetica", 14))
+
+    def show(self, image: np.ndarray, grid_size: int, game: PuzzleGame) -> None:
+        self._grid = grid_size
+        self._extent = image.shape[0]
+        self._photo = self._to_photo(self._with_faint_grid(image, grid_size))
+        self.delete("all")
+        self.create_image(0, 0, image=self._photo, anchor="nw")
+        self.draw_overlays(game)
+
+    def draw_overlays(self, game: PuzzleGame) -> None:   # overridden by subclasses
+        pass
+
+    def draw_hint_circle(self, position: int) -> None:
+        x0, y0, x1, y1 = self.cell_box(position)
+        pad = self.cell * 0.15
+        self.create_oval(x0 + pad, y0 + pad, x1 - pad, y1 - pad, outline=HINT_COLOUR, width=4)
+
+    @staticmethod
+    def _with_faint_grid(image: np.ndarray, grid_size: int) -> np.ndarray:
+        overlay = image.copy()
+        side = image.shape[0]
+        for i in range(1, grid_size):
+            p = i * side // grid_size
+            cv2.line(overlay, (p, 0), (p, side), (255, 255, 255), 1)
+            cv2.line(overlay, (0, p), (side, p), (255, 255, 255), 1)
+        return cv2.addWeighted(overlay, 0.4, image, 0.6, 0)
+
+    @staticmethod
+    def _to_photo(image: np.ndarray) -> tk.PhotoImage:
+        ok, buffer = cv2.imencode(".png", image)
+        return tk.PhotoImage(data=base64.b64encode(buffer.tobytes()))
+
+
+class OriginalCanvas(BoardCanvas):
+    def draw_overlays(self, game: PuzzleGame) -> None:
+        if game.hint is not None:
+            self.draw_hint_circle(game.hint[1])
+
+
+class PuzzleCanvas(BoardCanvas):
+    def draw_overlays(self, game: PuzzleGame) -> None:
+        for position in game.correct_positions:
+            self._draw_tick(position)
+        if game.selected is not None:
+            x0, y0, x1, y1 = self.cell_box(game.selected)
+            self.create_rectangle(x0 + 2, y0 + 2, x1 - 2, y1 - 2, outline=SELECT_COLOUR, width=4)
+        if game.hint is not None:
+            self.draw_hint_circle(game.hint[0])
+
+    def _draw_tick(self, position: int) -> None:
+        x0, y0, x1, y1 = self.cell_box(position)
+        u = self.cell / 100.0                     
+        pts = [x1 - 30 * u, y0 + 16 * u, x1 - 22 * u, y0 + 25 * u, x1 - 8 * u, y0 + 8 * u]
+        self.create_line(*pts, fill="white", width=6, capstyle="round", joinstyle="round")
+        self.create_line(*pts, fill=TICK_COLOUR, width=3, capstyle="round", joinstyle="round")
+
+
+class PuzzleApp(tk.Tk):
+    TIME_LIMITS = {"No limit": None, "1 minute": 60, "2 minutes": 120, "5 minutes": 300, "10 minutes": 600}
+    TICK_MS = 250                        
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.title("Scrambled Image Puzzle")
+        self.resizable(False, False)
+        self._game: Optional[PuzzleGame] = None
+        self._grid_var = tk.IntVar(value=DEFAULT_GRID)
+        self._limit_var = tk.StringVar(value="No limit")
+        self._announced = False          
+        self._board_size = 480 if self.winfo_screenwidth() >= 1200 else 420
+        self._build_widgets()
+        self._refresh()
+        self.after(self.TICK_MS, self._tick)
+
+    # layout 
+    def _build_widgets(self) -> None:
+        pad = {"padx": 6, "pady": 6}
+
+        bar = ttk.Frame(self)
+        bar.grid(row=0, column=0, columnspan=2, sticky="ew", **pad)
+        ttk.Button(bar, text="Load Image...", command=self._load_image).pack(side="left")
+        ttk.Label(bar, text="   Next puzzle - grid:").pack(side="left")
+        for n in GRID_CHOICES:
+            ttk.Radiobutton(bar, text=f"{n} × {n}", value=n, variable=self._grid_var).pack(side="left", padx=3)
+        ttk.Label(bar, text="  time limit:").pack(side="left")
+        ttk.Combobox(bar, textvariable=self._limit_var, values=list(self.TIME_LIMITS),
+                     state="readonly", width=11).pack(side="left", padx=3)
+        self._solve_btn = ttk.Button(bar, text="Solve", command=self._solve)
+        self._solve_btn.pack(side="right")
+        self._hint_btn = ttk.Button(bar, text="Hint", command=self._hint)
+        self._hint_btn.pack(side="right", padx=6)
+
+        ttk.Label(self, text="Original (reference)", font=("Helvetica", 11, "bold")).grid(row=1, column=0)
+        ttk.Label(self, text="Puzzle (click here)", font=("Helvetica", 11, "bold")).grid(row=1, column=1)
+
+        self._original_canvas = OriginalCanvas(self, self._board_size)
+        self._original_canvas.grid(row=2, column=0, **pad)
+        self._puzzle_canvas = PuzzleCanvas(self, self._board_size)
+        self._puzzle_canvas.grid(row=2, column=1, **pad)
+        self._puzzle_canvas.bind("<Button-1>", self._on_left_click)
+        self._puzzle_canvas.bind("<Button-3>", self._on_right_click)
+        self._puzzle_canvas.bind("<Button-2>", self._on_right_click)   
+
+        score = ttk.LabelFrame(self, text="Score")
+        score.grid(row=3, column=0, columnspan=2, sticky="ew", **pad)
+        self._moves_var, self._wrong_var, self._hints_var = tk.StringVar(), tk.StringVar(), tk.StringVar()
+        self._time_var = tk.StringVar()
+        for var in (self._moves_var, self._wrong_var, self._hints_var):
+            ttk.Label(score, textvariable=var, font=("Helvetica", 12)).pack(side="left", padx=18, pady=4)
+        self._time_label = ttk.Label(score, textvariable=self._time_var, font=("Helvetica", 12, "bold"))
+        self._time_label.pack(side="right", padx=18, pady=4)
+
+        self._status_var = tk.StringVar()
+        ttk.Label(self, textvariable=self._status_var, foreground="#444").grid(
+            row=4, column=0, columnspan=2, sticky="w", padx=8, pady=(0, 8))
+
+    #  actions 
+    def _load_image(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Choose an image",
+            filetypes=[("Image files", "*.jpg *.jpeg *.png *.bmp"), ("All files", "*.*")])
+        if not path:
+            return
+        grid = self._grid_var.get()
+        try:
+            picture = ImageProcessor.prepare(ImageProcessor.load(path), grid, self._board_size)
+        except ValueError as exc:
+            messagebox.showerror("Cannot open image", str(exc))
+            return
+        self._game = PuzzleGame(picture, grid, self.TIME_LIMITS[self._limit_var.get()])
+        self._announced = False
+        self._status_var.set("Left click: select / swap    Right click: rotate 90° clockwise    "
+                             "Shift + left click: flip horizontally")
+        self._refresh()
+
+    def _tile_under(self, event: tk.Event) -> Optional[int]:
+        if self._game is None or self._game.locked:
+            return None
+        return self._puzzle_canvas.position_at(event.x, event.y)
+
+    def _on_left_click(self, event: tk.Event) -> None:
+        """Left click selects or swaps; Shift + left click flips."""
+        position = self._tile_under(event)
+        if position is None:
+            return
+        if event.state & 0x0001:            
+            self._game.flip(position)
+        else:
+            self._game.click(position)
+        self._after_player_action()
+
+    def _on_right_click(self, event: tk.Event) -> None:
+        position = self._tile_under(event)
+        if position is not None:
+            self._game.rotate(position)
+            self._after_player_action()
+
+    def _after_player_action(self) -> None:
+        self._refresh()
+        if self._game.timed_out:
+            self._check_timeout()
+            return
+        if self._game.finished and not self._game.auto_solved:
+            self.update_idletasks()        
+            messagebox.showinfo(
+                "Puzzle solved!",
+                f"Well done! You restored the picture in {self._game.moves} moves and "
+                f"{GameTimer.format(self._game.elapsed)}, using {self._game.hints_used} hint(s)."
+                "\n\nLoad another image to keep playing.")
+            self._status_var.set("Puzzle complete - load another image to keep playing.")
+
+    def _hint(self) -> None:
+        """Hint button handler."""
+        if self._game is None:
+            return
+        if self._game.use_hint():
+            self._refresh()
+        else:
+            self._check_timeout()          
+
+    def _solve(self) -> None:
+        """Solve button handler."""
+        if self._game is None or self._game.locked:
+            return
+        if self._game.solve():
+            self._refresh()
+            self._status_var.set("Solved automatically - load another image to keep playing.")
+        else:
+            self._check_timeout()
+
+    #  timer 
+    def _tick(self) -> None:
+        if self._game is not None:
+            self._game.tick()
+            self._update_time_label()
+            self._check_timeout()
+        self.after(self.TICK_MS, self._tick)
+
+    def _check_timeout(self) -> None:
+        game = self._game
+        if game is None or not game.timed_out or self._announced:
+            return
+        self._announced = True
+        self._refresh()
+        self.update_idletasks()
+        messagebox.showinfo("Time's up!", "Time's up! The puzzle is now locked.\n\n"
+                            "Load another image to play again.")
+        self._status_var.set("Time's up! - load another image to play again.")
+
+    def _update_time_label(self) -> None:
+        game = self._game
+        if game is None:
+            self._time_var.set("Time: 0:00")
+            self._time_label.config(foreground="")
+            return
+        left = game.time_left
+        if left is None:
+            self._time_var.set(f"Time: {GameTimer.format(game.elapsed)}")
+            urgent = False
+        else:
+            self._time_var.set(f"Time left: {GameTimer.format(math.ceil(left))}")
+            urgent = left <= 10 and not game.finished
+        self._time_label.config(foreground="#c62828" if urgent else "")
+
+    # redraw 
+    def _refresh(self) -> None:
+        game = self._game
+        if game is None:
+            self._moves_var.set("Moves: 0")
+            self._wrong_var.set("Tiles incorrect: –")
+            self._hints_var.set(f"Hints left: {PuzzleGame.MAX_HINTS}")
+            self._status_var.set("Choose a grid size and time limit, then click “Load Image...”.")
+            self._hint_btn.config(state="disabled", text="Hint")
+            self._solve_btn.config(state="disabled")
+            self._update_time_label()
+            return
+        self._original_canvas.show(game.original_image, game.grid_size, game)
+        self._puzzle_canvas.show(game.transformed_image, game.grid_size, game)
+        self._moves_var.set(f"Moves: {game.moves}")
+        self._wrong_var.set(f"Tiles incorrect: {game.incorrect_count}")
+        self._hints_var.set(f"Hints left: {game.hints_left}")
+        can_hint = not game.locked and game.hints_left > 0
+        self._hint_btn.config(state="normal" if can_hint else "disabled", text=f"Hint ({game.hints_left})")
+        self._solve_btn.config(state="disabled" if game.locked else "normal")
+        self._update_time_label()
+
+
+if __name__ == "__main__":
+    PuzzleApp().mainloop()
