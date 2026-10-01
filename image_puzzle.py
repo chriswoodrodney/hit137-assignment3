@@ -235,3 +235,121 @@ class PuzzleBoard:
 # ==========================================================================
 # Image processing (OpenCV) and scrambling
 # ==========================================================================
+class ImageProcessor:
+    @staticmethod
+    def load(path: str) -> np.ndarray:
+        try:
+            data = np.fromfile(path, dtype=np.uint8)
+            image = cv2.imdecode(data, cv2.IMREAD_COLOR) if data.size else None
+        except (OSError, cv2.error) as exc:
+            raise ValueError(f"Could not read the file: {exc}") from exc
+        if image is None:
+            raise ValueError("That file is not a readable image (use JPG, PNG or BMP).")
+        return image
+
+    @staticmethod
+    def prepare(image: np.ndarray, grid_size: int, target: int) -> np.ndarray:
+        side = (target // grid_size) * grid_size
+        h, w = image.shape[:2]
+        edge = min(h, w)                                  
+        top, left = (h - edge) // 2, (w - edge) // 2
+        square = image[top:top + edge, left:left + edge]  
+        interp = cv2.INTER_AREA if edge > side else cv2.INTER_CUBIC
+        return cv2.resize(square, (side, side), interpolation=interp)
+
+    @staticmethod
+    def split(image: np.ndarray, grid_size: int) -> List[Tile]:
+        step = image.shape[0] // grid_size
+        tiles = []
+        for r in range(grid_size):
+            for c in range(grid_size):
+                block = image[r * step:(r + 1) * step, c * step:(c + 1) * step]
+                tiles.append(Tile(r * grid_size + c, np.ascontiguousarray(block)))
+        return tiles
+
+
+class Scrambler:
+    TRANSFORM_COUNT = {3: 6, 4: 12, 5: 20}
+
+    def __init__(self, rng: Optional[random.Random] = None) -> None:
+       self._rng = rng or random.Random()
+
+    def _make_swap(self, free: List[int]) -> Transformation:
+       return SwapTransformation(free.pop(), free.pop())
+
+    def _make_rotate(self, free: List[int]) -> Transformation:
+       return RotateTransformation(free.pop(), self._rng.choice((1, 2, 3)))
+
+    def _make_flip(self, free: List[int]) -> Transformation:
+       return FlipTransformation(free.pop(), self._rng.choice((True, False)))
+
+    def generate(self, grid_size: int) -> List[Transformation]:
+        cells = grid_size * grid_size
+        count = self.TRANSFORM_COUNT[grid_size]
+        max_swaps = cells - count                      
+        chosen = [self._make_swap, self._make_rotate, self._make_flip]   
+        swaps = 1
+        while len(chosen) < count:
+            maker = self._rng.choice((self._make_swap, self._make_rotate, self._make_flip))
+            if maker == self._make_swap:
+                if swaps >= max_swaps:
+                    continue
+                swaps += 1
+            chosen.append(maker)
+        self._rng.shuffle(chosen)
+        free = self._rng.sample(range(cells), cells)    
+        return [make(free) for make in chosen]
+
+    def scramble(self, board: PuzzleBoard) -> List[Transformation]:
+        while True:
+            board.solve()
+            applied = self.generate(board.grid_size)
+            for transformation in applied:
+                board.apply(transformation)
+            if not board.is_solved():
+                return applied
+
+
+# ==========================================================================
+# Game logic (no Tkinter in here, so it can be tested on its own)
+# ==========================================================================
+class GameTimer:
+    def __init__(self, limit_seconds: Optional[int] = None,
+                 clock: Callable[[], float] = time.monotonic) -> None:
+        self._limit = limit_seconds
+        self._clock = clock
+        self._start = clock()
+        self._stopped_at: Optional[float] = None
+
+    @property
+    def limit(self) -> Optional[int]:
+        return self._limit
+
+    @property
+    def elapsed(self) -> float:
+        end = self._stopped_at if self._stopped_at is not None else self._clock()
+        return end - self._start
+
+    @property
+    def remaining(self) -> Optional[float]:
+        if self._limit is None:
+            return None
+        return max(0.0, self._limit - self.elapsed)
+
+    @property
+    def running(self) -> bool:
+       return self._stopped_at is None
+
+    def is_expired(self) -> bool:
+       return self._limit is not None and self.elapsed >= self._limit
+
+    def stop(self) -> None:
+        if self._stopped_at is None:
+            self._stopped_at = self._clock()
+
+    @staticmethod
+    def format(seconds: float) -> str:
+        whole = int(seconds)
+        return f"{whole // 60}:{whole % 60:02d}"
+
+
