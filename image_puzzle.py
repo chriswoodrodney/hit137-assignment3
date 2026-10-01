@@ -353,3 +353,157 @@ class GameTimer:
         return f"{whole // 60}:{whole % 60:02d}"
 
 
+class PuzzleGame:
+    MAX_HINTS = 3
+
+    def __init__(self, image: np.ndarray, grid_size: int, time_limit: Optional[int] = None,
+                 clock: Callable[[], float] = time.monotonic) -> None:
+        self._timer = GameTimer(time_limit, clock)
+        self._timed_out = False
+        self._original = image
+        self._board = PuzzleBoard(ImageProcessor.split(image, grid_size), grid_size)
+        self._transformations = Scrambler().scramble(self._board)
+        self._moves = 0
+        self._hints_used = 0
+        self._hint: Optional[Tuple[int, int]] = None   
+        self._selected: Optional[int] = None
+        self._finished = False
+        self._auto_solved = False
+
+    #  read-only state 
+    def grid_size(self) -> int:
+        return self._board.grid_size
+
+    @property
+    def original_image(self) -> np.ndarray:
+       return self._original
+
+    @property
+    def transformed_image(self) -> np.ndarray:
+        return self._board.assemble()
+
+    @property
+    def moves(self) -> int:
+        return self._moves
+
+    @property
+    def incorrect_count(self) -> int:
+        return len(self._board.incorrect_positions())
+
+    @property
+    def correct_positions(self) -> List[int]:
+        return self._board.correct_positions()
+
+    @property
+    def selected(self) -> Optional[int]:
+        return self._selected
+
+    @property
+    def hint(self) -> Optional[Tuple[int, int]]:
+        return self._hint
+
+    @property
+    def hints_left(self) -> int:
+        return self.MAX_HINTS - self._hints_used
+
+    @property
+    def hints_used(self) -> int:
+        return self._hints_used
+
+    @property
+    def finished(self) -> bool:
+        return self._finished
+
+    @property
+    def timed_out(self) -> bool:
+        return self._timed_out
+
+    @property
+    def locked(self) -> bool:
+        return self._finished or self._timed_out
+
+    @property
+    def time_limit(self) -> Optional[int]:
+        return self._timer.limit
+
+    @property
+    def elapsed(self) -> float:
+        return self._timer.elapsed
+
+    @property
+    def time_left(self) -> Optional[float]:
+        return self._timer.remaining
+
+    @property
+    def auto_solved(self) -> bool:
+        return self._auto_solved
+
+    # -- player actions ---------------------------------------------------
+    def _play(self, transformation: Transformation) -> None:
+        self._board.apply(transformation)
+        self._moves += 1
+        self._hint = None                       
+        if self._board.is_solved():
+            self._finished = True
+            self._selected = None
+            self._timer.stop()
+
+    def tick(self) -> None:
+        if not self.locked and self._timer.is_expired():
+            self._timed_out = True
+            self._timer.stop()
+            self._selected = None
+            self._hint = None
+
+    def click(self, position: int) -> None:
+        self.tick()
+        if self.locked:
+            return
+        if self._selected is None:
+            self._selected = position
+        elif self._selected == position:
+            self._selected = None
+        else:
+            first, self._selected = self._selected, None
+            self._play(SwapTransformation(first, position))
+
+    def rotate(self, position: int) -> None:
+        self.tick()
+        if not self.locked:
+            self._play(RotateTransformation(position, 1))
+
+    def flip(self, position: int) -> None:
+        self.tick()
+        if not self.locked:
+            self._play(FlipTransformation(position, horizontal=True))
+
+    def use_hint(self) -> bool:
+        self.tick()
+        if self.locked or self._hint is not None or self.hints_left <= 0:
+            return False
+        position = random.choice(self._board.incorrect_positions())
+        self._hint = (position, self._board.tile_at(position).home)
+        self._hints_used += 1
+        return True
+
+    def solve(self) -> bool:
+        self.tick()
+        if self.locked:
+            return False
+        self._board.solve()
+        self._moves = 0
+        self._hint = None
+        self._selected = None
+        self._finished = True
+        self._auto_solved = True
+        self._timer.stop()
+        return True
+
+    def __str__(self) -> str:
+        return (f"PuzzleGame {self.grid_size}x{self.grid_size}: {self._moves} moves, "
+                f"{self.incorrect_count} tiles incorrect, {self.hints_left} hints left")
+
+
+# ==========================================================================
+# View layer (Tkinter)
+# ==========================================================================
